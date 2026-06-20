@@ -85,6 +85,35 @@ OPENAI_MODEL_FALLBACK=gpt-5.1
 Lihat `.env.example` untuk daftar lengkap variabel yang bisa dikonfigurasi
 (path scanner, ruleset Semgrep, lokasi database, dst).
 
+### Memakai router/proxy OpenAI-compatible (TokenRouter, OpenRouter, dst)
+
+Sistem ini bisa dipakai lewat router/proxy yang OpenAI-compatible, bukan hanya
+OpenAI resmi. Isi `.env`:
+```
+OPENAI_API_KEY=sk-key-dari-router-anda
+OPENAI_BASE_URL=https://api.tokenrouter.com/v1
+OPENAI_MODEL=nama-model-sesuai-router-anda
+OPENAI_MODEL_FALLBACK=
+```
+Catatan penting:
+- `OPENAI_MODEL` harus diisi dengan **model ID yang dikenali router Anda**
+  (cek dashboard/dokumentasi router), bukan nama model OpenAI asli seperti
+  `gpt-5.5` -- kecuali router Anda memang memetakan nama itu ke provider
+  tertentu.
+- **Kosongkan `OPENAI_MODEL_FALLBACK`** kalau memakai router dengan model
+  custom. Fallback ini didesain untuk OpenAI resmi (gpt-5.5 → gpt-5.1) --
+  kalau dibiarkan terisi nama OpenAI asli sementara Anda memakai router,
+  fallback akan mencoba memanggil model yang mungkin tidak dikenal router
+  Anda saat model utama gagal, menghasilkan error baru bukan membantu.
+- Endpoint router HARUS mendukung `response_format={"type": "json_object"}`
+  (structured JSON output) -- ini dipakai `core/llm_client.py` untuk semua
+  pemanggilan analisis. Kalau router Anda tidak mendukung ini, `complete_json`
+  akan gagal parsing meski request terkirim. Cek dokumentasi router Anda
+  untuk memastikan dukungan ini ada.
+- Validasi `validate_config()` melonggarkan pengecekan format API key
+  (tidak memaksa prefix `sk-`) begitu `OPENAI_BASE_URL` diisi, karena
+  provider router berbeda bisa punya format key sendiri.
+
 ## 3. Menjalankan Scan
 
 **Smart contract repo (akan otomatis pakai Slither):**

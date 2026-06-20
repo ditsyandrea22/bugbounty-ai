@@ -42,10 +42,24 @@ except ImportError:
         stacklevel=2,
     )
 
-# --- OpenAI ---
+# --- OpenAI (atau router/proxy OpenAI-compatible seperti TokenRouter) ---
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.5")
-OPENAI_MODEL_FALLBACK = os.environ.get("OPENAI_MODEL_FALLBACK", "gpt-5.1")
+
+# Base URL opsional -- kosongkan untuk memakai OpenAI resmi (default SDK).
+# Untuk router/proxy OpenAI-compatible (TokenRouter, OpenRouter, dst), isi
+# dengan endpoint mereka, contoh: https://api.tokenrouter.com/v1
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip() or None
+
+# Fallback model HANYA relevan kalau memakai OpenAI resmi dengan nama model
+# OpenAI asli (gpt-5.5 -> gpt-5.1, dst). Kalau Anda memakai router/proxy
+# dengan nama model custom (lihat OPENAI_MODEL di atas), KOSONGKAN variabel
+# ini di .env -- nama fallback OpenAI asli tidak akan dikenali router Anda,
+# dan kalau dipaksa tetap diisi, llm_client.py akan mencoba memanggil model
+# yang tidak ada di router Anda saat fallback terpicu (akan gagal lagi
+# dengan error baru, bukan membantu). Default tetap diisi untuk pengguna
+# yang memakai OpenAI resmi langsung (tanpa OPENAI_BASE_URL).
+OPENAI_MODEL_FALLBACK = os.environ.get("OPENAI_MODEL_FALLBACK", "gpt-5.1").strip() or None
 
 # --- Path kerja ---
 WORKDIR = Path(os.environ.get("BBAI_WORKDIR", BASE_DIR / "workdir"))
@@ -115,10 +129,25 @@ def validate_config(check_scanners: bool = True) -> tuple[list[str], list[str]]:
             "Copy .env.example ke .env lalu isi nilai asli Anda, atau set environment "
             "variable OPENAI_API_KEY secara manual."
         )
-    elif not OPENAI_API_KEY.startswith("sk-"):
+    elif not OPENAI_BASE_URL and not OPENAI_API_KEY.startswith("sk-"):
+        # Validasi prefix "sk-" HANYA relevan kalau memakai OpenAI resmi
+        # (base_url kosong). Begitu OPENAI_BASE_URL diisi (router/proxy
+        # custom seperti TokenRouter), format key bisa berbeda-beda
+        # tergantung provider router -- jadi validasi ini di-skip supaya
+        # tidak salah menolak key yang sebenarnya valid untuk router tersebut.
         problems.append(
             "OPENAI_API_KEY terisi tapi tidak diawali 'sk-' -- kemungkinan format salah "
-            "atau ter-copy tidak lengkap."
+            "atau ter-copy tidak lengkap. (Catatan: kalau Anda memakai router/proxy custom "
+            "via OPENAI_BASE_URL, format key BISA berbeda dari OpenAI asli -- isi "
+            "OPENAI_BASE_URL di .env supaya validasi ini tidak salah menolak key Anda.)"
+        )
+
+    if OPENAI_BASE_URL:
+        warnings_list.append(
+            f"[INFO] Memakai base_url custom: {OPENAI_BASE_URL}. Pastikan endpoint ini "
+            f"benar-benar OpenAI-compatible (mendukung response_format=json_object untuk "
+            f"structured output), dan OPENAI_MODEL diisi dengan nama model yang dikenali "
+            f"provider ini (bukan nama model OpenAI asli)."
         )
 
     if check_scanners:

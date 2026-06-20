@@ -39,7 +39,7 @@ from openai import (
     RateLimitError,
 )
 
-from config import OPENAI_API_KEY, OPENAI_MODEL, OPENAI_MODEL_FALLBACK
+from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, OPENAI_MODEL_FALLBACK
 
 logger = logging.getLogger("bugbounty_ai.llm_client")
 
@@ -56,13 +56,34 @@ MAX_BACKOFF_SECONDS = 20.0
 
 
 class LLMClient:
-    def __init__(self, api_key: str | None = None, model: str | None = None):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+    ):
+        """
+        base_url: untuk memakai OpenAI resmi, biarkan None (default SDK).
+        Untuk router/proxy OpenAI-compatible (TokenRouter, OpenRouter, dst),
+        isi dengan endpoint mereka (atau set OPENAI_BASE_URL di .env --
+        lihat config.py). Endpoint router HARUS compatible dengan format
+        request/response OpenAI Chat Completions API (termasuk dukungan
+        response_format={"type": "json_object"} yang dipakai complete_json
+        di bawah) -- kalau router tidak mendukung structured JSON output,
+        complete_json bisa gagal parsing meski request berhasil terkirim.
+        """
         if not (api_key or OPENAI_API_KEY):
             raise RuntimeError(
                 "OPENAI_API_KEY belum diset. Set environment variable OPENAI_API_KEY "
                 "atau pass api_key= saat membuat LLMClient."
             )
-        self.client = OpenAI(api_key=api_key or OPENAI_API_KEY)
+        resolved_base_url = base_url or OPENAI_BASE_URL
+        client_kwargs: dict[str, Any] = {"api_key": api_key or OPENAI_API_KEY}
+        if resolved_base_url:
+            client_kwargs["base_url"] = resolved_base_url
+            logger.info("LLMClient memakai base_url custom: %s", resolved_base_url)
+
+        self.client = OpenAI(**client_kwargs)
         self.model = model or OPENAI_MODEL
         self.fallback_model = OPENAI_MODEL_FALLBACK
 
