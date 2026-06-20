@@ -1,0 +1,171 @@
+rules:
+
+  - id: single-block-oracle-manipulation
+    patterns:
+      - pattern: |
+          $PRICE = $ORACLE.getPrice(...);
+      - pattern-not: |
+          $PRICE = $ORACLE.getTwap(...);
+      - pattern-not: |
+          $PRICE = $ORACLE.consult(...);
+    message: >
+      Harga diambil dari oracle dalam satu blok tanpa TWAP (Time-Weighted Average Price).
+      Attacker bisa memanipulasi harga di blok yang sama menggunakan flash loan, lalu
+      mengeksploitasi protokol sebelum harga kembali normal (price oracle manipulation).
+      Gunakan TWAP dengan window minimal 30 menit, atau Chainlink price feed.
+    languages: [solidity]
+    severity: ERROR
+    metadata:
+      category: oracle-manipulation
+      bounty_relevance: critical
+      cwe: CWE-20
+
+  - id: reentrancy-eth-transfer-before-state
+    patterns:
+      - pattern: |
+          function $FUNC(...) $MOD {
+            ...
+            $ADDR.call{value: $VAL}(...);
+            ...
+            $STATE = $NEWVAL;
+            ...
+          }
+    message: >
+      Transfer ETH (via .call) dilakukan SEBELUM update state. Ini pola klasik reentrancy:
+      attacker bisa membuat kontrak penerima yang memanggil kembali fungsi ini sebelum
+      state (balance, flag, dll) diupdate. Ikuti pola Checks-Effects-Interactions:
+      1) cek kondisi, 2) update state, 3) baru lakukan external call.
+    languages: [solidity]
+    severity: ERROR
+    metadata:
+      category: reentrancy
+      bounty_relevance: critical
+
+  - id: arbitrary-delegatecall
+    patterns:
+      - pattern: |
+          $ADDR.delegatecall($DATA);
+      - pattern-not: |
+          require($ADDR == $TRUSTED, ...);
+    message: >
+      delegatecall ke address yang bisa dikontrol input (tidak di-whitelist atau hanya
+      dicek dengan require yang bisa di-bypass). Attacker bisa menyuntikkan kontrak
+      berbahaya sebagai $ADDR dan mengeksekusi kode sewenang-wenang dalam konteks
+      storage kontrak ini -- termasuk mengubah owner, menarik seluruh dana, atau
+      self-destruct.
+    languages: [solidity]
+    severity: ERROR
+    metadata:
+      category: delegatecall-abuse
+      bounty_relevance: critical
+
+  - id: missing-slippage-protection
+    patterns:
+      - pattern: |
+          $POOL.swap($AMOUNT_IN, 0, ...);
+      - pattern-not: |
+          $POOL.swap($AMOUNT_IN, $MIN_OUT, ...);
+    message: >
+      Swap dilakukan dengan minAmountOut = 0 (tidak ada slippage protection).
+      Attacker bisa melakukan sandwich attack: front-run dengan swap besar untuk
+      menggerakkan harga, biarkan transaksi korban dieksekusi di harga buruk,
+      lalu back-run untuk profit. Parameter minAmountOut harus dihitung dari
+      harga oracle dengan tolerance slippage yang wajar (misal 0.5%).
+    languages: [solidity]
+    severity: ERROR
+    metadata:
+      category: front-running
+      bounty_relevance: high
+
+  - id: signature-replay-missing-nonce
+    patterns:
+      - pattern: |
+          $SIGNER = ecrecover($HASH, $V, $R, $S);
+      - pattern-not: |
+          $NONCE
+    message: >
+      Verifikasi signature tanpa nonce atau chain ID. Signature yang sama bisa
+      di-replay di transaksi berbeda atau di chain berbeda (cross-chain replay).
+      Sertakan nonce per-user yang di-increment setiap kali signature dipakai,
+      dan chain ID dalam pesan yang di-sign (sesuai EIP-712).
+    languages: [solidity]
+    severity: ERROR
+    metadata:
+      category: signature-replay
+      bounty_relevance: high
+
+  - id: unchecked-return-value-external-call
+    patterns:
+      - pattern: |
+          $ADDR.call(...);
+      - pattern-not: |
+          (bool $SUCCESS, ...) = $ADDR.call(...);
+      - pattern-not: |
+          require($ADDR.call(...));
+    message: >
+      Return value dari .call() tidak di-cek. Kalau call gagal (misal: target adalah
+      kontrak yang revert, atau tidak ada ETH cukup), transaksi akan tetap lanjut
+      seolah berhasil. Selalu destructure: (bool success, bytes memory data) = addr.call(...)
+      dan require(success, "call failed").
+    languages: [solidity]
+    severity: WARNING
+    metadata:
+      category: unchecked-external-call
+      bounty_relevance: medium
+
+  - id: tx-origin-authentication
+    pattern: |
+      require(tx.origin == $ADDR, ...);
+    message: >
+      Menggunakan tx.origin untuk authentication. Ini berbahaya karena tx.origin
+      selalu menunjuk ke EOA (wallet) yang memulai transaksi, BUKAN caller langsung.
+      Attacker bisa membuat kontrak perantara yang dipanggil korban -- tx.origin
+      akan tetap jadi korban sementara msg.sender adalah kontrak attacker.
+      Gunakan msg.sender untuk authentication.
+    languages: [solidity]
+    severity: ERROR
+    metadata:
+      category: access-control
+      bounty_relevance: high
+
+  - id: block-timestamp-dependency
+    patterns:
+      - pattern: |
+          block.timestamp $OP $DEADLINE;
+      - pattern-where-not:
+          - pattern: |
+              block.timestamp $OP $DEADLINE; // [SAFE] ...
+    message: >
+      Logika kritis bergantung pada block.timestamp. Miner bisa memanipulasi
+      timestamp dalam range ~15 detik. Untuk deadline pendek (< 1 menit) ini
+      bisa dieksploitasi. Untuk randomness, jangan gunakan timestamp sama sekali.
+    languages: [solidity]
+    severity: WARNING
+    metadata:
+      category: front-running
+      bounty_relevance: medium
+
+  - id: unprotected-initializer
+    patterns:
+      - pattern: |
+          function initialize(...) public {
+            ...
+          }
+      - pattern-not: |
+          function initialize(...) public initializer {
+            ...
+          }
+      - pattern-not: |
+          function initialize(...) public onlyOwner {
+            ...
+          }
+    message: >
+      Fungsi initialize() tanpa modifier initializer atau access control. Untuk
+      kontrak upgradeable (proxy pattern), jika implementasi kontrak tidak
+      di-initialize, siapa pun bisa memanggil initialize() dan mengambil ownership.
+      Gunakan modifier initializer dari OpenZeppelin atau tambahkan access control.
+    languages: [solidity]
+    severity: ERROR
+    metadata:
+      category: access-control
+      bounty_relevance: critical

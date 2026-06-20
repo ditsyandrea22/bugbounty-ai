@@ -1,0 +1,6 @@
+openai>=1.40.0
+pydantic>=2.6.0
+python-dotenv>=1.0.0
+slither-analyzer>=0.10.0
+semgrep>=1.70.0
+pyyaml>=6.0

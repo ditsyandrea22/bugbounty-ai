@@ -1,0 +1,23 @@
+# Secrets -- JANGAN PERNAH commit file ini
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Data hasil scan (bisa besar, dan reports/findings bisa mengandung info sensitif
+# tentang target yang sedang diaudit -- jangan ikut ter-commit tanpa sengaja)
+workdir/
+reports/*.md
+storage/findings.db
+storage/findings.db-wal
+storage/findings.db-shm
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

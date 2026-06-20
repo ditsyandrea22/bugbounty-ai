@@ -1,0 +1,180 @@
+rules:
+
+  - id: ssrf-unvalidated-url-fetch
+    patterns:
+      - pattern-either:
+          - pattern: requests.get($URL, ...)
+          - pattern: requests.post($URL, ...)
+          - pattern: urllib.request.urlopen($URL, ...)
+          - pattern: httpx.get($URL, ...)
+          - pattern: aiohttp.ClientSession().get($URL, ...)
+      - pattern-not: requests.get("https://...", ...)
+      - pattern-not: requests.get("http://...", ...)
+    message: >
+      URL yang di-fetch berasal dari variabel (kemungkinan user-controlled), bukan
+      literal hardcoded. Ini pola SSRF: attacker bisa mengirim URL internal
+      (http://169.254.169.254/ untuk cloud metadata, http://localhost:8080/admin,
+      file:///etc/passwd) dan membuat server mengaksesnya. Validasi URL dengan
+      allowlist domain, atau gunakan library khusus SSRF protection (ssrf-filter).
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: ssrf
+      bounty_relevance: high
+      cwe: CWE-918
+
+  - id: sql-injection-string-format
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $QUERY = f"... {$VAR} ..."
+              $CONN.execute($QUERY)
+          - pattern: |
+              $QUERY = "..." + $VAR + "..."
+              $CONN.execute($QUERY)
+          - pattern: |
+              $QUERY = "..." % $VAR
+              $CONN.execute($QUERY)
+    message: >
+      Query SQL dibangun dengan string formatting/concatenation dari variabel.
+      Ini pola klasik SQL injection. Gunakan parameterized queries:
+      cursor.execute("SELECT ... WHERE id = %s", (user_id,))
+      atau ORM dengan binding. Jangan pernah memasukkan input user langsung
+      ke string query.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: sql-injection
+      bounty_relevance: critical
+      cwe: CWE-89
+
+  - id: path-traversal-open
+    patterns:
+      - pattern-either:
+          - pattern: open(os.path.join($BASE, $USER_INPUT), ...)
+          - pattern: open($DIR + $USER_INPUT, ...)
+          - pattern: open(f"...{$USER_INPUT}...", ...)
+      - pattern-not: open(os.path.join($BASE, os.path.basename($USER_INPUT)), ...)
+    message: >
+      File dibuka dengan path yang mengandung input pengguna tanpa normalisasi.
+      Attacker bisa menggunakan "../../../etc/passwd" atau symlink untuk mengakses
+      file di luar direktori yang diizinkan. Gunakan os.path.realpath() dan pastikan
+      hasil path masih di dalam direktori yang diizinkan sebelum membuka file.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: path-traversal
+      bounty_relevance: high
+      cwe: CWE-22
+
+  - id: hardcoded-secret-in-code
+    patterns:
+      - pattern-either:
+          - pattern: $KEY = "sk-..."
+          - pattern: $KEY = "AKIA..."
+          - pattern: password = "$PWD"
+          - pattern: secret = "$SEC"
+          - pattern: api_key = "$KEY"
+      - pattern-not: $KEY = os.environ.get(...)
+      - pattern-not: $KEY = os.getenv(...)
+    message: >
+      Secret/credential hardcoded di source code. Siapa pun yang bisa membaca
+      kode (termasuk via git history) bisa menggunakan credential ini.
+      Pindahkan ke environment variable atau secrets manager (Vault, AWS SSM).
+    languages: [python, javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: sensitive-data-exposure
+      bounty_relevance: high
+      cwe: CWE-798
+
+  - id: mass-assignment-django
+    patterns:
+      - pattern: $MODEL(**$REQUEST.POST.dict())
+      - pattern-not: $MODEL(**$FORM.cleaned_data)
+    message: >
+      Mass assignment dari request.POST langsung ke model Django. Attacker bisa
+      mengirim field tambahan yang tidak dimaksudkan (misal: is_admin=True,
+      role=superuser) dan mempengaruhi field sensitif yang tidak ada di form.
+      Gunakan Form atau Serializer dengan explicit field definition, atau
+      gunakan whitelist field yang diizinkan.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: mass-assignment
+      bounty_relevance: high
+      cwe: CWE-915
+
+  - id: insecure-deserialization-pickle
+    patterns:
+      - pattern-either:
+          - pattern: pickle.loads($DATA)
+          - pattern: pickle.load($FILE)
+    message: >
+      Deserialisasi dengan pickle dari sumber yang berpotensi user-controlled.
+      pickle.loads() dari input tidak terpercaya memungkinkan Remote Code Execution
+      (RCE) -- attacker bisa membuat payload pickle yang mengeksekusi perintah
+      arbitrary saat di-deserialize. Gunakan format aman (JSON, msgpack) untuk
+      data dari user. Jika harus pakai pickle, pastikan data berasal dari sumber
+      terpercaya dan di-sign.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: rce
+      bounty_relevance: critical
+      cwe: CWE-502
+
+  - id: jwt-algorithm-none
+    patterns:
+      - pattern-either:
+          - pattern: 'jwt.decode($TOKEN, algorithms=["none"])'
+          - pattern: 'jwt.decode($TOKEN, options={"verify_signature": False})'
+          - pattern: jwt.decode($TOKEN, verify=False)
+    message: >
+      JWT di-decode tanpa verifikasi signature (algorithm "none" atau verify=False).
+      Attacker bisa membuat JWT palsu dengan klaim apa pun (misal: admin=true,
+      user_id=1) dan melewati authentication. Selalu verifikasi signature dengan
+      secret/key yang kuat dan whitelist algorithm yang diizinkan.
+    languages: [python, javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: authentication-bypass
+      bounty_relevance: critical
+      cwe: CWE-347
+
+  - id: idor-direct-object-reference
+    patterns:
+      - pattern: |
+          $OBJ = $MODEL.objects.get(id=$REQUEST.$METHOD["id"])
+      - pattern-not: |
+          $OBJ = $MODEL.objects.get(id=$REQUEST.$METHOD["id"], user=$REQUEST.user)
+    message: >
+      Object diambil langsung berdasarkan ID dari request tanpa memverifikasi
+      kepemilikan/permission pengguna yang sedang login. Ini pola IDOR: attacker
+      bisa mengganti ID di request untuk mengakses data milik pengguna lain.
+      Tambahkan filter ownership: Model.objects.get(id=id, user=request.user)
+      atau gunakan get_object_or_404 dengan filter tambahan.
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: idor
+      bounty_relevance: high
+      cwe: CWE-639
+
+  - id: open-redirect
+    patterns:
+      - pattern-either:
+          - pattern: redirect($REQUEST.GET.get("next", ...))
+          - pattern: redirect($REQUEST.GET["redirect_url"])
+          - pattern: HttpResponseRedirect($REQUEST.GET.get(...))
+    message: >
+      Redirect ke URL dari parameter query string tanpa validasi. Attacker bisa
+      menggunakan https://yoursite.com/login?next=https://evil.com untuk membuat
+      phishing yang terlihat seperti domain asli. Validasi bahwa URL redirect
+      masih dalam domain yang sama sebelum melakukan redirect.
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: open-redirect
+      bounty_relevance: medium
+      cwe: CWE-601
