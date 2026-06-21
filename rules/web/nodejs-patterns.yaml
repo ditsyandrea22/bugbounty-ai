@@ -1,0 +1,260 @@
+rules:
+
+  # --- Cross-Site Scripting (XSS) ---
+  # Kategori yang sebelumnya TIDAK ADA sama sekali di ruleset web -- ini
+  # salah satu vuln paling sering dilaporkan di bug bounty web app.
+
+  - id: react-dangerously-set-innerhtml
+    patterns:
+      - pattern: '<$EL dangerouslySetInnerHTML={{__html: $VAR}} />'
+      - pattern-not: '<$EL dangerouslySetInnerHTML={{__html: DOMPurify.sanitize($VAR)}} />'
+    message: >
+      dangerouslySetInnerHTML dipakai dengan variabel yang tidak melalui sanitasi
+      (DOMPurify atau sejenisnya). Kalau $VAR berasal dari input user (komentar,
+      bio, nama, dst), ini Stored/Reflected XSS -- attacker bisa menyuntikkan
+      <script> atau event handler HTML yang dieksekusi di browser korban.
+      Selalu sanitasi HTML sebelum dirender, misal dengan DOMPurify.sanitize().
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: xss
+      bounty_relevance: high
+      cwe: CWE-79
+
+  - id: express-response-send-unescaped
+    patterns:
+      - pattern-either:
+          - pattern: res.send(`<...${$VAR}...>`)
+          - pattern: res.write(`<...${$VAR}...>`)
+      - pattern-not: res.send(`<...${escapeHtml($VAR)}...>`)
+    message: >
+      HTML response dibangun dengan template literal yang menyisipkan variabel
+      langsung tanpa escaping. Kalau $VAR berasal dari query param/body/header,
+      ini Reflected XSS. Gunakan template engine yang auto-escape (EJS, Pug
+      default mode) atau escape manual dengan library seperti escape-html.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: xss
+      bounty_relevance: high
+      cwe: CWE-79
+
+  - id: document-write-from-location
+    patterns:
+      - pattern-either:
+          - pattern: document.write(location.$PROP)
+          - pattern: document.write(window.location.$PROP)
+          - pattern: $EL.innerHTML = location.$PROP
+          - pattern: $EL.innerHTML = window.location.$PROP
+    message: >
+      DOM XSS klasik: location.href/search/hash ditulis langsung ke DOM tanpa
+      sanitasi. Attacker bisa membuat URL seperti site.com/#<script>...</script>
+      dan korban yang klik link akan menjalankan script attacker. Sanitasi nilai
+      dari location sebelum dimasukkan ke DOM, atau gunakan textContent bukan
+      innerHTML/document.write kalau hanya perlu menampilkan teks.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: xss
+      bounty_relevance: high
+      cwe: CWE-79
+
+  # --- NoSQL Injection (MongoDB) ---
+  # Stack Node sering pakai MongoDB -- kelas injection ini berbeda dari SQL
+  # injection klasik dan tidak tertangkap rule sql-injection-string-format
+  # yang sudah ada (itu untuk SQL/Python).
+
+  - id: mongodb-operator-injection
+    patterns:
+      - pattern-either:
+          - pattern: $MODEL.find($REQ.body)
+          - pattern: $MODEL.find($REQ.query)
+          - pattern: $MODEL.findOne($REQ.body)
+          - pattern: $MODEL.findOne($REQ.query)
+          - pattern: $MODEL.updateOne($REQ.body, ...)
+    message: >
+      Query MongoDB dibangun langsung dari req.body/req.query tanpa sanitasi.
+      Attacker bisa menyuntikkan MongoDB operator (misal {"$gt": ""} sebagai
+      value password) untuk bypass authentication atau mengubah logika query
+      sepenuhnya -- ini NoSQL injection. Gunakan library seperti
+      express-mongo-sanitize untuk membersihkan operator ($) dari input, atau
+      whitelist field yang diizinkan secara eksplisit.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: sql-injection
+      bounty_relevance: critical
+      cwe: CWE-943
+
+  - id: mongodb-where-javascript-injection
+    pattern-either:
+      - pattern: '$MODEL.find({$$where: $VAR})'
+      - pattern: 'db.collection($COL).find({$$where: $VAR})'
+    message: >
+      $where di MongoDB mengeksekusi JavaScript di server database. Kalau $VAR
+      mengandung input user, ini setara Remote Code Execution di context
+      MongoDB -- attacker bisa menjalankan JavaScript arbitrary. Hindari $where
+      sepenuhnya untuk query yang melibatkan input user; gunakan operator query
+      standar MongoDB.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: rce
+      bounty_relevance: critical
+      cwe: CWE-94
+
+  # --- Prototype Pollution ---
+  # Kelas vuln yang spesifik JavaScript, tidak ada equivalentnya di Python.
+
+  - id: prototype-pollution-merge
+    patterns:
+      - pattern-either:
+          - pattern: _.merge($TARGET, $REQ.body)
+          - pattern: $.extend(true, $TARGET, $REQ.body)
+          - pattern: Object.assign($TARGET, $REQ.body)
+          - pattern: merge($TARGET, JSON.parse($USERINPUT))
+    message: >
+      Deep merge/extend dengan object dari input user tanpa validasi key.
+      Attacker bisa menyuntikkan key "__proto__" atau "constructor.prototype"
+      untuk mencemari Object.prototype global -- prototype pollution bisa
+      berujung ke DoS, bypass logic aplikasi, atau dalam kasus tertentu RCE
+      (lewat library yang vulnerable terhadap gadget chain). Gunakan
+      Object.create(null) untuk object yang menerima input user, atau validasi
+      key tidak mengandung "__proto__"/"constructor"/"prototype" sebelum merge.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: logic-bug
+      bounty_relevance: high
+      cwe: CWE-1321
+
+  # --- JWT & Session (Node-specific patterns) ---
+
+  - id: jwt-secret-hardcoded
+    patterns:
+      - pattern-either:
+          - pattern: jwt.sign($PAYLOAD, "...")
+          - pattern: jwt.verify($TOKEN, "...")
+    message: >
+      JWT secret berupa string literal hardcoded di kode, bukan dari environment
+      variable. Siapa pun yang membaca source code (termasuk lewat git history
+      atau decompile bundle frontend kalau secret ini salah dipakai di client)
+      bisa membuat token palsu dengan claim apa pun. Pindahkan secret ke
+      environment variable, dan pakai secret yang panjang & random (minimal 256-bit
+      untuk HS256).
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: authentication-bypass
+      bounty_relevance: critical
+      cwe: CWE-798
+
+  - id: express-session-no-secure-cookie
+    patterns:
+      - pattern: |
+          session({..., cookie: {secure: false, ...}, ...})
+      - pattern-not-inside: |
+          if (process.env.NODE_ENV !== "production") { ... }
+    message: >
+      Session cookie diset secure:false di luar pengecekan environment development.
+      Di production, cookie tanpa flag Secure bisa dikirim lewat koneksi HTTP biasa
+      (bukan HTTPS), membuatnya rentan disadap di jaringan tidak aman (misal WiFi
+      publik). Set secure:true untuk production, dan pastikan httpOnly:true juga
+      aktif untuk mencegah pencurian cookie lewat XSS.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: authentication-bypass
+      bounty_relevance: medium
+      cwe: CWE-614
+
+  # --- Command Injection (Node child_process) ---
+
+  - id: child-process-exec-user-input
+    patterns:
+      - pattern-either:
+          - pattern: exec($CMD)
+          - pattern: execSync($CMD)
+          - pattern: child_process.exec($CMD)
+      - pattern-not: exec("...")
+    message: >
+      child_process.exec() dipanggil dengan command yang dibangun dari variabel
+      (kemungkinan input user), bukan string literal. exec() menjalankan command
+      lewat shell -- attacker bisa menyuntikkan karakter shell (;, |, &&, $()) untuk
+      menjalankan command arbitrary di server (RCE). Gunakan execFile() atau spawn()
+      dengan argumen array terpisah (bukan string tunggal lewat shell), yang tidak
+      melewati shell interpretation.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: rce
+      bounty_relevance: critical
+      cwe: CWE-78
+
+  # --- Next.js specific ---
+
+  - id: nextjs-api-route-no-method-check
+    patterns:
+      - pattern: |
+          export default function handler(req, res) {
+            ...
+          }
+      - pattern-not-inside: |
+          export default function handler(req, res) {
+            ...
+            if (req.method !== "...") { ... }
+            ...
+          }
+    message: >
+      API route Next.js (pages/api/*) tidak memvalidasi req.method. Tanpa
+      pengecekan ini, endpoint yang dimaksud hanya untuk GET bisa juga diakses
+      lewat POST/PUT/DELETE dengan logic yang sama -- bisa membuka aksi yang
+      tidak dimaksudkan (misal endpoint read-only ternyata bisa menerima POST
+      yang memicu side-effect). Validasi req.method secara eksplisit di awal
+      handler dan kembalikan 405 untuk method yang tidak didukung.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: logic-bug
+      bounty_relevance: medium
+
+  - id: nextjs-ssrf-via-rewrites-proxy
+    patterns:
+      - pattern-either:
+          - pattern: fetch(`${$BASE}${$REQ.query.$PARAM}`)
+          - pattern: axios.get($REQ.query.$PARAM)
+    message: >
+      Server-side fetch/axios memakai URL dari query parameter langsung. Ini
+      pola SSRF di API route/middleware Next.js -- attacker bisa mengarahkan
+      server untuk request ke internal network atau cloud metadata endpoint.
+      Validasi/whitelist domain tujuan sebelum melakukan server-side fetch
+      berdasarkan input user.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: ssrf
+      bounty_relevance: high
+      cwe: CWE-918
+
+  # --- CORS misconfiguration ---
+
+  - id: cors-reflect-origin-with-credentials
+    patterns:
+      - pattern-either:
+          - pattern: |
+              cors({origin: true, credentials: true, ...})
+          - pattern: |
+              res.setHeader("Access-Control-Allow-Origin", $REQ.headers.origin)
+    message: >
+      CORS dikonfigurasi untuk merefleksikan origin permintaan APAPUN sambil
+      mengizinkan credentials (cookie/auth header). Ini secara efektif menghapus
+      proteksi Same-Origin Policy -- situs jahat mana pun bisa membuat request
+      ke API ini atas nama pengguna yang sedang login (membawa cookie session
+      mereka) dan membaca responsnya. Whitelist origin yang diizinkan secara
+      eksplisit, jangan refleksikan origin request apa pun ketika credentials:true.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: csrf
+      bounty_relevance: high
+      cwe: CWE-942

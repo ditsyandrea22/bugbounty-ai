@@ -160,6 +160,7 @@ finding juga tersimpan di SQLite (`storage/findings.db`) untuk query/audit trail
 | `core/pipeline.py` | Orchestrator — menjalankan semua agent secara berurutan |
 | `core/dedup.py` | Menggabungkan evidence duplikat (lokasi overlap) sebelum dikirim ke GPT |
 | `core/cost_guard.py` | Cap jumlah evidence per scan + prioritisasi, supaya biaya API terkontrol |
+| `core/solc_manager.py` | Auto-detect dan auto-install versi solc yang cocok dengan pragma kontrak |
 | `core/prompt_safety.py` | Mitigasi prompt injection dari konten repo target |
 | `core/cross_file_context.py` | Membangun konteks lintas file (import/dependency) untuk deteksi bug multi-file |
 | `core/severity_rubric.py` | Rubrik severity eksplisit berbasis kriteria Immunefi/HackerOne |
@@ -395,3 +396,190 @@ Implikasi praktis: **hasil dari sistem ini adalah titik awal yang kuat
 untuk investigasi manusia, bukan laporan siap-submit otomatis.** Semakin
 kritis/bernilai temuannya, semakin penting verifikasi manual sebelum
 disclosure.
+
+## 10. Pelacakan Bug Web App: JS/TS + Dynamic Scanning (ZAP)
+
+Ditambahkan dua peningkatan khusus untuk web app, terutama stack Node/Express/Next.js:
+
+### 10.1. Custom rules JavaScript/TypeScript
+
+`rules/web/nodejs-patterns.yaml` -- 12 rules baru yang sebelumnya tidak
+tercakup `rules/web/web-security-patterns.yaml` (yang Python-sentris):
+
+| Kategori | Rules |
+|---|---|
+| XSS (sebelumnya TIDAK ADA sama sekali) | `react-dangerously-set-innerhtml`, `express-response-send-unescaped`, `document-write-from-location` |
+| NoSQL Injection (MongoDB) | `mongodb-operator-injection`, `mongodb-where-javascript-injection` |
+| Prototype Pollution | `prototype-pollution-merge` |
+| JWT/Session | `jwt-secret-hardcoded`, `express-session-no-secure-cookie` |
+| Command Injection | `child-process-exec-user-input` |
+| Next.js spesifik | `nextjs-api-route-no-method-check`, `nextjs-ssrf-via-rewrites-proxy` |
+| CORS | `cors-reflect-origin-with-credentials` |
+
+File ini otomatis ter-include oleh `semgrep_runner.py` (men-scan seluruh
+folder `rules/web/`, termasuk subfile baru) -- tidak perlu konfigurasi
+tambahan, langsung aktif begitu `python cli.py scan <target-js-repo>` dijalankan.
+
+### 10.2. Dynamic scanning dengan OWASP ZAP
+
+Berbeda dari Slither/Semgrep (membaca source code statis), ZAP **menjalankan
+request HTTP nyata** ke aplikasi yang benar-benar berjalan -- menemukan bug
+yang hanya muncul saat runtime (misal: response header yang salah, behavior
+endpoint yang berbeda dari yang terlihat di kode karena middleware/config).
+
+**Prasyarat -- install dan jalankan ZAP daemon dahulu** (di luar proyek ini):
+```bash
+# Download ZAP dari https://www.zaproxy.org/download/
+zap.sh -daemon -port 8080 -config api.key=<your-api-key>
+```
+
+**Menjalankan dynamic scan:**
+```bash
+python cli.py scan-dynamic http://localhost:3000 \
+  --i-have-authorization \
+  --zap-api-key <your-api-key>
+```
+
+**PERINGATAN KERAS -- baca sebelum menjalankan:**
+- `--i-have-authorization` **WAJIB** diisi eksplisit. Tanpa flag ini, scan
+  ditolak. Ini bukan formalitas -- active scan ZAP mengirim ribuan request
+  dengan payload uji (SQLi, XSS, command injection, dst) ke SETIAP endpoint
+  yang ditemukan, yang merupakan traffic NYATA ke target.
+- **Hanya jalankan terhadap**: (a) environment lokal/development milik Anda
+  sendiri (`localhost`, `127.0.0.1` -- selalu diizinkan), atau (b) target
+  yang SUDAH dikonfirmasi dalam scope program bug bounty resmi yang
+  mengizinkan automated/active scanning.
+- `scanners/zap_runner.py` punya daftar domain yang TIDAK PERNAH diizinkan
+  (google.com, facebook.com, microsoft.com, dst) sebagai safety net dasar
+  terhadap kesalahan ketik/kecerobohan -- ini BUKAN pengaman lengkap.
+  Tanggung jawab verifikasi otorisasi tetap ada di tangan operator.
+- Active scan bisa memicu rate-limiting atau WAF block di sisi target, dan
+  bisa memakan waktu lama (default timeout 30 menit) untuk aplikasi besar.
+
+**Keterbatasan implementasi saat ini:**
+- Evidence dari ZAP dianalisis GPT berdasarkan deskripsi alert ZAP saja
+  (tidak ada snippet source code, karena ZAP tidak punya akses ke source
+  code -- ia hanya melihat response HTTP). Finding dari dynamic scan
+  karenanya tidak punya "Root Cause" yang merujuk baris kode spesifik
+  seperti finding dari static scan.
+- Tidak ada autentikasi otomatis ke aplikasi target -- kalau aplikasi Anda
+  butuh login untuk mengakses sebagian besar fitur, ZAP hanya akan
+  menemukan endpoint yang bisa diakses tanpa login, kecuali Anda
+  mengonfigurasi context/session ZAP secara manual lewat ZAP UI/API
+  sebelum menjalankan `scan-dynamic` (di luar scope wrapper ini saat ini).
+- PoC (Exploit Simulator) belum terintegrasi untuk finding dari dynamic
+  scan -- saat ini hanya jalan untuk finding dari static scan.
+
+## 11. Perbaikan dari Eksekusi Nyata Pertama
+
+Audit pertama menggunakan eksekusi nyata (bukan analisis statis kode) terhadap
+repo smart contract sungguhan (`3FLabs/grunt`) lewat router custom (TokenRouter)
+menemukan dua masalah yang tidak pernah ketemu lewat audit statis sebelumnya:
+
+### 11.1. Chain-of-thought reasoning model bocor ke laporan
+
+**Masalah:** Model reasoning (gaya DeepSeek-R1/QwQ, diakses lewat router) menyertakan
+blok `<think>...</think>` berisi seluruh chain-of-thought di DALAM field `content`
+response, sebelum jawaban final. Tanpa pembersihan, blok ini ikut tertulis mentah-mentah
+ke laporan (`Attack Surface Overview` di laporan nyata penuh dengan reasoning internal
+model, bukan hanya hasil akhirnya).
+
+**Perbaikan:** `core/llm_client.py` sekarang punya `_strip_think_blocks()` yang
+membuang tag `<think>`, `<thinking>`, `<reasoning>` (termasuk kasus tag tidak
+ditutup karena terpotong `max_tokens`) dari SEMUA output model -- baik
+`complete_json` maupun `complete_text` -- sebelum diproses lebih lanjut.
+Diverifikasi dengan replikasi kasus nyata persis dari laporan yang ditemukan.
+
+### 11.2. Slither gagal total karena solc version mismatch
+
+**Masalah:** Slither return `returncode=1` tanpa output JSON sama sekali, karena
+versi solc yang aktif di environment tidak cocok dengan pragma kontrak target.
+Sistem peringatan yang sudah ada bekerja benar (operator diberi tahu ini KEGAGALAN,
+bukan "kode bersih"), tapi tidak ada mekanisme untuk benar-benar mengatasinya --
+operator harus manual `solc-select install X.Y.Z && solc-select use X.Y.Z`.
+
+**Perbaikan:** `core/solc_manager.py` -- modul baru yang:
+1. Scan semua file `.sol` di repo, ekstrak pragma constraint (`^0.8.19`, `>=0.8.0 <0.9.0`, dst).
+2. Tentukan versi solc yang memenuhi SEMUA constraint yang ditemukan (resolusi
+   semver minimal, tanpa dependency eksternal).
+3. Install otomatis lewat `solc-select` kalau versi itu belum ada, lalu aktifkan.
+
+Dipanggil otomatis di awal `SlitherScanner.run()` -- tidak perlu konfigurasi
+tambahan. Kalau auto-resolve gagal (constraint antar file benar-benar tidak
+kompatibel, atau `solc-select` tidak terinstal), Slither tetap dicoba dengan
+versi yang sudah aktif, dan pesan error sekarang menyertakan diagnostik
+tambahan (`_diagnose_likely_cause`) yang mendeteksi tanda dependency Foundry/
+Hardhat yang belum di-install (`forge install`/`npm install`) sebagai
+kemungkinan penyebab LAIN selain version mismatch -- relevan untuk repo
+kompleks dengan banyak integrasi pihak ketiga seperti yang ditemukan di
+pengujian nyata.
+
+**Keterbatasan yang masih berlaku:**
+- Auto-install solc butuh koneksi internet (download binary compiler). Kalau
+  tidak ada koneksi, auto-resolve akan gagal dengan pesan jelas, bukan hang.
+- Diagnostik Foundry/Hardhat hanya mendeteksi TANDA dependency hilang (folder
+  `lib/`/`node_modules/` tidak ada) -- tidak otomatis menjalankan `forge install`
+  atau `npm install` untuk Anda (itu bisa mengeksekusi script pihak ketiga dari
+  repo yang belum tepercaya, di luar scope yang aman untuk dilakukan otomatis).
+- Resolusi pragma constraint memakai implementasi semver minimal (cukup untuk
+  pola umum pragma Solidity), bukan library semver lengkap -- kasus pragma yang
+  sangat tidak biasa mungkin tidak teresolusi dengan tepat.
+
+## 12. Perbaikan dari Eksekusi Nyata Kedua (Diagnostik Remapping)
+
+Eksekusi kedua terhadap repo `3FLabs/grunt` mengonfirmasi perbaikan think-block
+(section 11.1) berhasil -- laporan bersih dari reasoning leak. Tapi Slither masih
+gagal, dan ditemukan dua masalah baru:
+
+### 12.1. Bug: stderr kosong di laporan padahal compiler menulis error ke stdout
+
+**Masalah:** Untuk proyek Foundry-based, `crytic-compile` sering meneruskan
+output `forge build` APA ADANYA -- dan compiler error dari forge ditulis ke
+STDOUT, bukan stderr. Versi sebelumnya hanya menampilkan `result.stderr` di
+pesan error, sehingga operator melihat "Stderr: (kosong)" padahal compiler
+sebenarnya menulis detail error penting ke stdout yang tidak pernah ditampilkan.
+
+**Perbaikan:** `scanners/slither_runner.py` sekarang menampilkan KEDUA stdout
+dan stderr di pesan error, dengan label jelas mana yang "sering berisi compile
+error untuk proyek Foundry".
+
+### 12.2. Diagnostik remapping ditingkatkan dari generik ke actionable
+
+**Masalah:** Diagnostik sebelumnya hanya bilang "pastikan path remapping valid"
+tanpa benar-benar mengecek path mana yang bermasalah -- operator harus menebak
+sendiri remapping mana dari puluhan yang mungkin ada di proyek besar.
+
+**Perbaikan:** `_validate_remappings()` membaca isi `remappings.txt` DAN
+`foundry.toml` (`[profile.default] remappings = [...]`), lalu mengecek
+SETIAP target remapping benar-benar ada di disk. Hanya remapping yang
+path-nya hilang yang dilaporkan, dengan path lengkap yang bermasalah --
+bukan saran generik. Diverifikasi dengan test yang mensimulasikan
+remapping hilang (`lib/openzeppelin-contracts/` tidak ada) vs remapping
+valid, memastikan tidak ada false positive untuk remapping yang benar.
+
+Juga ditambahkan deteksi folder `lib/` yang ADA tapi KOSONG (submodule
+git belum di-init) -- kasus berbeda dari `lib/` yang tidak ada sama sekali,
+dengan saran perbaikan berbeda (`git submodule update --init --recursive`).
+
+### 12.3. Opsi auto-install dependency (default MATI, harus diaktifkan sadar)
+
+**Baru ditambahkan:** `BBAI_AUTO_INSTALL_DEPS=true` di `.env` mengaktifkan
+auto-run `forge install`/`npm install` sebelum Slither dijalankan, kalau
+dependency terdeteksi hilang. Ini mengatasi AKAR PENYEBAB (bukan hanya
+mendiagnosis), tapi:
+
+**PERINGATAN:** default-nya MATI dengan sengaja. Menjalankan `forge install`/
+`npm install` berarti mengeksekusi script dari repo target (npm `postinstall`
+hooks, forge install scripts) yang BELUM TEPERCAYA. Hanya aktifkan untuk repo
+yang Anda percaya atau sudah ditinjau -- jangan aktifkan untuk scan sembarangan
+terhadap target bug bounty yang tidak dikenal, karena itu setara menjalankan
+kode arbitrary dari pihak yang sedang Anda audit.
+
+**Cara pakai:**
+```
+# di .env
+BBAI_AUTO_INSTALL_DEPS=true
+```
+Lalu jalankan scan seperti biasa -- auto-install akan jalan otomatis kalau
+`foundry.toml` ada tapi `lib/` kosong/hilang, atau `package.json`/
+`hardhat.config` ada tapi `node_modules/` hilang.

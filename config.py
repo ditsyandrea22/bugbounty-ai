@@ -73,6 +73,15 @@ REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 #   pip install slither-analyzer semgrep
 SLITHER_BIN = os.environ.get("SLITHER_BIN", "slither")
 SEMGREP_BIN = os.environ.get("SEMGREP_BIN", "semgrep")
+
+# Auto-install dependency repo target (forge install / npm install) kalau
+# terdeteksi hilang -- DEFAULT MATI. Operator harus aktifkan SADAR via
+# BBAI_AUTO_INSTALL_DEPS=true di .env, karena ini mengeksekusi script dari
+# repo target yang belum tepercaya (npm postinstall hooks, forge install
+# scripts) -- hanya aktifkan untuk repo yang Anda percaya/sudah ditinjau.
+AUTO_INSTALL_DEPENDENCIES = os.environ.get("BBAI_AUTO_INSTALL_DEPS", "false").strip().lower() in (
+    "true", "1", "yes",
+)
 FORGE_BIN = os.environ.get("FORGE_BIN", "forge")
 
 # Ruleset semgrep default. "p/security-audit", "p/owasp-top-ten" adalah

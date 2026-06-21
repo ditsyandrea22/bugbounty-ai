@@ -18,12 +18,29 @@ STRATEGI RETRY (diperbaiki dari versi awal):
   name, dst). Error non-retryable langsung di-raise tanpa membuang waktu
   retry yang tidak akan pernah berhasil, dan pesan errornya jelas
   (misal "API key invalid") bukan tersembunyi di balik riwayat retry.
+
+REASONING MODEL SUPPORT (ditambahkan setelah ditemukan di pemakaian nyata):
+Beberapa model reasoning (DeepSeek-R1, QwQ, dan model lain yang diakses
+lewat router/proxy seperti TokenRouter) menyertakan chain-of-thought di
+DALAM field `content` itu sendiri, dibungkus tag <think>...</think>,
+SEBELUM jawaban final. Tanpa pembersihan, blok <think> ini:
+- Untuk complete_json: bisa membuat json.loads() gagal total (karena
+  <think>...</think>{...json...} bukan JSON valid), atau dalam kasus
+  lebih buruk DITERIMA sebagai bagian dari prompt analisis berikutnya.
+- Untuk complete_text (dipakai ThreatModeler/ReportWriter): blok <think>
+  ikut tertulis mentah-mentah ke laporan final -- inilah yang terjadi
+  pada laporan nyata yang ditemukan saat penggunaan dengan router custom.
+Beberapa provider/router menaruh reasoning di field terpisah
+(`message.reasoning_content`) bukan di `content` -- _strip_think_blocks
+menangani kasus tag-di-dalam-content; kasus field terpisah otomatis aman
+karena kita hanya membaca `message.content`.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -42,6 +59,48 @@ from openai import (
 from config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, OPENAI_MODEL_FALLBACK
 
 logger = logging.getLogger("bugbounty_ai.llm_client")
+
+# Pola tag reasoning yang umum dipakai berbagai reasoning model. Daftar ini
+# sengaja mencakup beberapa varian (bukan hanya <think>) karena provider
+# berbeda kadang memakai tag berbeda untuk konsep yang sama.
+_THINK_BLOCK_PATTERNS = [
+    re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<thinking>.*?</thinking>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<reasoning>.*?</reasoning>", re.DOTALL | re.IGNORECASE),
+]
+
+# Kalau tag pembuka ada tapi tag penutup TIDAK ADA (terpotong karena
+# max_tokens atau alasan lain), buang dari tag pembuka sampai akhir teks --
+# lebih baik kehilangan sebagian output yang valid daripada membiarkan
+# chain-of-thought yang terpotong bocor ke laporan.
+_UNCLOSED_THINK_PATTERNS = [
+    re.compile(r"<think>.*", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<thinking>.*", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<reasoning>.*", re.DOTALL | re.IGNORECASE),
+]
+
+
+def _strip_think_blocks(text: str) -> str:
+    """
+    Membuang blok chain-of-thought (<think>...</think> dan varian serupa)
+    dari output model. Dipakai di SEMUA titik yang membaca `content` dari
+    response -- baik untuk JSON (_call_once) maupun teks bebas
+    (complete_text) -- supaya reasoning model lewat router manapun tidak
+    mencemari hasil akhir, apa pun agent yang memanggilnya.
+    """
+    if not text or "<think" not in text.lower() and "<reasoning" not in text.lower():
+        return text  # fast path: tidak ada indikasi tag reasoning sama sekali
+
+    cleaned = text
+    for pattern in _THINK_BLOCK_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+
+    # Setelah buang yang closed-tag, cek lagi apakah masih ada tag pembuka
+    # tanpa penutup (kemungkinan terpotong oleh max_tokens).
+    for pattern in _UNCLOSED_THINK_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+
+    return cleaned.strip()
 
 # Error yang PANTAS di-retry -- biasanya transient (akan hilang sendiri
 # kalau dicoba lagi setelah delay).
@@ -225,7 +284,14 @@ class LLMClient:
             ],
         )
         content = response.choices[0].message.content
-        return json.loads(content)
+        cleaned_content = _strip_think_blocks(content)
+        if cleaned_content != content:
+            logger.info(
+                "Membuang reasoning block (<think> dst) dari response model '%s' "
+                "sebelum parsing JSON -- terdeteksi reasoning model.",
+                model,
+            )
+        return json.loads(cleaned_content)
 
     def complete_text(
         self, system_prompt: str, user_prompt: str, temperature: float = 0.2, max_retries: int = 2
@@ -249,7 +315,15 @@ class LLMClient:
                         {"role": "user", "content": user_prompt},
                     ],
                 )
-                return response.choices[0].message.content or ""
+                raw_content = response.choices[0].message.content or ""
+                cleaned = _strip_think_blocks(raw_content)
+                if cleaned != raw_content:
+                    logger.info(
+                        "Membuang reasoning block (<think> dst) dari response model '%s' "
+                        "(complete_text) -- terdeteksi reasoning model.",
+                        self.model,
+                    )
+                return cleaned
             except _NON_RETRYABLE_EXCEPTIONS as e:
                 raise RuntimeError(f"Error non-retryable dari OpenAI API ({type(e).__name__}): {e}") from e
             except Exception as e:  # noqa: BLE001

@@ -71,6 +71,28 @@ def cmd_scan(args: argparse.Namespace) -> None:
         print(f"Submission drafts ({args.bounty_format}): {out_path}")
 
 
+def cmd_scan_dynamic(args: argparse.Namespace) -> None:
+    pipeline = AuditPipeline(db_path=DB_PATH)
+    report = pipeline.run_dynamic_scan(
+        target_url=args.target_url,
+        confirm_authorized=args.i_have_authorization,
+        zap_api_url=args.zap_api_url,
+        zap_api_key=args.zap_api_key,
+        generate_summary=not args.no_summary,
+    )
+
+    confirmed = [f for f in report.findings if f.validator_verdict == "confirmed"]
+    print("\n=== DYNAMIC SCAN SELESAI ===")
+    print(f"Target        : {report.target.path}")
+    print(f"Total findings: {len(report.findings)}")
+    print(f"Confirmed     : {len(confirmed)}")
+
+    import pathlib
+
+    repo_name = pathlib.Path(report.target.path).name or "dynamic_target"
+    print(f"Report        : reports/{repo_name}_report.md")
+
+
 def cmd_list_runs(args: argparse.Namespace) -> None:
     from storage.db import FindingsDB
 
@@ -123,10 +145,41 @@ def main() -> None:
     list_parser = sub.add_parser("list-runs", help="Lihat riwayat scan yang tersimpan di DB.")
     list_parser.set_defaults(func=cmd_list_runs)
 
+    dynamic_parser = sub.add_parser(
+        "scan-dynamic",
+        help="Dynamic scan (OWASP ZAP) terhadap target URL yang BENAR-BENAR BERJALAN.",
+    )
+    dynamic_parser.add_argument(
+        "target_url", help="URL target yang sudah running, contoh: http://localhost:3000"
+    )
+    dynamic_parser.add_argument(
+        "--i-have-authorization",
+        action="store_true",
+        help=(
+            "WAJIB diset eksplisit. Menyatakan Anda sudah memiliki otorisasi untuk "
+            "menjalankan active scan (mengirim traffic uji nyata) terhadap target ini -- "
+            "baik karena ini environment lokal/development milik Anda sendiri, atau "
+            "target sudah dikonfirmasi dalam scope program bug bounty resmi. Tanpa flag "
+            "ini, scan akan ditolak."
+        ),
+    )
+    dynamic_parser.add_argument(
+        "--zap-api-url",
+        default="http://localhost:8080",
+        help="URL API ZAP daemon yang sudah berjalan. Default: http://localhost:8080",
+    )
+    dynamic_parser.add_argument(
+        "--zap-api-key", default="", help="API key ZAP, kalau daemon dikonfigurasi memerlukannya."
+    )
+    dynamic_parser.add_argument(
+        "--no-summary", action="store_true", help="Skip pembuatan executive summary via GPT."
+    )
+    dynamic_parser.set_defaults(func=cmd_scan_dynamic)
+
     args = parser.parse_args()
 
-    if args.command == "scan":
-        problems, warnings_list = validate_config()
+    if args.command in ("scan", "scan-dynamic"):
+        problems, warnings_list = validate_config(check_scanners=(args.command == "scan"))
         if problems:
             print("=== KONFIGURASI BELUM LENGKAP ===", file=sys.stderr)
             for p in problems:

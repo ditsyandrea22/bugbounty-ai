@@ -29,10 +29,11 @@ from core.cost_guard import DEFAULT_MAX_EVIDENCE_PER_SCAN, apply_cost_guard
 from core.dedup import deduplicate_evidence
 from core.diff_analysis import DiffAnalyzer
 from core.llm_client import LLMClient
-from core.models import Evidence, ScanReport, ScanTarget
+from core.models import Evidence, ScanReport, ScanTarget, TargetType
 from core.repo_indexer import RepoIndexer
 from scanners.semgrep_runner import SemgrepScanner
 from scanners.slither_runner import SlitherScanner
+from scanners.zap_runner import ZapConfig, ZapScanner
 from storage.db import FindingsDB
 
 logger = logging.getLogger("bugbounty_ai.pipeline")
@@ -252,3 +253,78 @@ class AuditPipeline:
         )
         Path(output_path).write_text(final_content, encoding="utf-8")
         logger.info("Report written to: %s", output_path)
+
+    def run_dynamic_scan(
+        self,
+        target_url: str,
+        confirm_authorized: bool,
+        zap_api_url: str = "http://localhost:8080",
+        zap_api_key: str = "",
+        generate_summary: bool = True,
+    ) -> ScanReport:
+        """
+        Dynamic scan terhadap aplikasi web yang BENAR-BENAR BERJALAN (live),
+        memakai OWASP ZAP. Ini method TERPISAH dari run() (static scan) karena:
+        - Input-nya URL target, bukan path repo/source code.
+        - Butuh konfirmasi otorisasi eksplisit (confirm_authorized) -- lihat
+          peringatan keras di scanners/zap_runner.py.
+        - Tidak ada cross-file context atau diff mode (konsep itu spesifik
+          source code statis, tidak relevan untuk dynamic scan).
+
+        Evidence dari ZAP dianalisis dengan agent yang SAMA (Vulnerability
+        Hunter, False Positive Checker) seperti static scan -- konsisten
+        secara arsitektur: scanner nyata dulu, GPT menganalisis evidence-nya,
+        bukan GPT menebak sendiri.
+
+        Catatan: VulnerabilityHunter.analyze() membaca snippet kode dari
+        file lokal (code_reader.py) untuk evidence statis -- untuk evidence
+        ZAP, "file_path" sebenarnya berisi URL endpoint, bukan path file,
+        jadi code_reader akan gagal resolve path (is_reliable=False) dan
+        finding otomatis masuk needs_human_review. Ini BENAR secara desain:
+        evidence ZAP dianalisis berdasarkan raw_message-nya (deskripsi alert
+        ZAP) tanpa snippet kode, bukan dipaksa mencari source code yang
+        sebenarnya tidak relevan untuk dynamic finding.
+        """
+        zap_config = ZapConfig(zap_api_url=zap_api_url, api_key=zap_api_key)
+        zap = ZapScanner(config=zap_config)
+
+        logger.info("Memulai dynamic scan (OWASP ZAP) terhadap: %s", target_url)
+        evidences = zap.run(target_url, confirm_authorized=confirm_authorized)
+        logger.info("ZAP menghasilkan %d evidence.", len(evidences))
+
+        # ScanTarget sintetis untuk merepresentasikan target dynamic scan --
+        # path diisi dengan URL karena tidak ada path filesystem yang relevan.
+        target = ScanTarget(
+            path=target_url,
+            repo_url=None,
+            target_type=TargetType.WEB_BACKEND,
+            languages=[],
+        )
+
+        if not evidences:
+            report = ScanReport(target=target, findings=[], scanners_used=["owasp_zap"])
+            self._write_outputs(report, "_(Dynamic scan -- tidak ada attack surface overview, lihat alert ZAP langsung.)_")
+            return report
+
+        # Reuse VulnerabilityHunter -- code_reader tetap dibuat meski tidak
+        # akan banyak berguna di sini (file_path evidence ZAP adalah URL,
+        # bukan path lokal), supaya alur analisis konsisten dengan static scan.
+        code_reader = CodeReader(repo_root=".")
+        hunter = VulnerabilityHunter(self.llm, code_reader, target_type=target.target_type.value)
+        findings = hunter.analyze_batch(evidences)
+
+        fp_checker = FalsePositiveChecker(self.llm, code_reader=code_reader)
+        findings = fp_checker.validate_batch(findings)
+
+        confirmed_count = sum(1 for f in findings if f.validator_verdict == "confirmed")
+        logger.info("Dynamic scan validation complete. %d/%d confirmed.", confirmed_count, len(findings))
+
+        report = ScanReport(target=target, findings=findings, scanners_used=["owasp_zap"])
+        self._write_outputs(
+            report,
+            "_(Dynamic scan terhadap target live -- attack surface overview tidak relevan, "
+            "lihat daftar endpoint yang di-spider ZAP di laporan ZAP asli kalau diperlukan.)_",
+            generate_summary=generate_summary,
+        )
+        self.db.save_report(report)
+        return report
